@@ -26,7 +26,7 @@ def train_fallback_model(df, target_col='dropout_label', exclude_cols=None):
     X = df[_feature_cols].copy()
     y = df[target_col].copy()
     
-    print(f"🌲 Training local fallback HistGradientBoosting model on {X.shape[0]} rows and {X.shape[1]} features...")
+    print(f"[ML] Training local fallback HistGradientBoosting model on {X.shape[0]} rows and {X.shape[1]} features...")
     
     # We use HistGradientBoostingClassifier since XGBoost fails on Mac without libomp
     _model = HistGradientBoostingClassifier(
@@ -37,18 +37,18 @@ def train_fallback_model(df, target_col='dropout_label', exclude_cols=None):
     )
     _model.fit(X, y)
     
-    print("🌲 Model trained successfully. Initializing SHAP explainer...")
+    print("[ML] Model trained successfully. Initializing SHAP explainer...")
     
     try:
         # HistGradientBoosting works with TreeExplainer, but fallback to Permutation if needed
         _explainer = shap.TreeExplainer(_model)
     except Exception as e:
-        print(f"⚠️ TreeExplainer failed ({e}). Falling back to general Explainer.")
+        print(f"[WARN] TreeExplainer failed ({e}). Falling back to general Explainer.")
         # Generate a background dataset for the general explainer (100 samples)
         background = shap.sample(X, 100)
         _explainer = shap.Explainer(_model.predict_proba, background)
         
-    print("✅ Fallback ML pipeline ready.")
+    print("[OK] Fallback ML pipeline ready.")
 
 def get_risk_scores(df):
     """

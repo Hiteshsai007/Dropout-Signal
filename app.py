@@ -12,6 +12,7 @@ from itertools import combinations
 
 import numpy as np
 import pandas as pd
+import requests as _requests_lib
 from flask import Flask, render_template, jsonify, request
 
 
@@ -42,7 +43,7 @@ def load_and_process_data():
             print("[WARN] No valid DATABRICKS_TOKEN provided in .env. Falling back to local offline CSV mode.")
             raise ValueError("No valid token")
 
-        print("🚀 Connecting to Live Databricks SQL Warehouse...")
+        print("[INFO] Connecting to Live Databricks SQL Warehouse...")
         conn = databricks.sql.connect(
             server_hostname=os.getenv("DATABRICKS_SERVER_HOSTNAME"),
             http_path=os.getenv("DATABRICKS_HTTP_PATH"),
@@ -51,12 +52,12 @@ def load_and_process_data():
         
         cursor = conn.cursor()
         
-        print("📥 Querying Silver layer...")
+        print("[INFO] Querying Silver layer...")
         cursor.execute("SELECT * FROM silver.uci_dropout_clean")
         cols = [desc[0] for desc in cursor.description]
         df = pd.DataFrame.from_records(cursor.fetchall(), columns=cols)
         
-        print("📥 Querying Gold layer...")
+        print("[INFO] Querying Gold layer...")
         try:
             cursor.execute("SELECT * FROM gold.at_risk_students")
             cols = [desc[0] for desc in cursor.description]
@@ -98,14 +99,26 @@ def load_and_process_data():
             lambda x: 'high_stress' if x >= 3 else 'low_stress')
         df['intersection'] = df['gender_label'].str.lower() + '_' + df['socioeconomic_group']
 
-        print("✅ Live Databricks Hook Successful! Loaded {} rows.".format(len(df)))
+        # --- Phase 2: Sentiment Score & Red Zone (simulated for live data too) ---
+        es_norm = df['engagement_score'].clip(0, 4) / 4.0 if 'engagement_score' in df.columns else 0.5
+        at_inv = 1 - df['absenteeism_trend'].clip(0, 1) if 'absenteeism_trend' in df.columns else 0.5
+        sem2_g = df['curricular_units_2nd_sem_grade'].clip(0, 20) / 20.0 if 'curricular_units_2nd_sem_grade' in df.columns else 0.5
+        
+        s_noise = df['student_id'].apply(
+            lambda sid: (int(hashlib.md5(f's{sid}'.encode()).hexdigest()[:6], 16) % 1000) / 5000 - 0.1
+        )
+        df['sentiment_score'] = (0.40 * es_norm + 0.35 * at_inv + 0.25 * sem2_g + s_noise).clip(0.05, 0.95).round(3)
+        
+        df['red_zone'] = ((df['financial_stress_index'] >= 3) & (df['sentiment_score'] < 0.40)).astype(int)
+
+        print("[OK] Live Databricks Hook Successful! Loaded {} rows.".format(len(df)))
         return df
 
 
     except Exception as e:
         if "No valid token" not in str(e):
              print(f"\n[ERROR] Databricks connection failed: {str(e)}")
-        print("\n[INFO] 🚨 FALLING BACK TO OFFLINE CSV MODE 🚨\n")
+        print("\n[INFO] FALLING BACK TO OFFLINE CSV MODE\n")
         
         # --- ORIGINAL CSV LOAD LOGIC ---
         df = pd.read_csv(CSV_PATH)
@@ -154,6 +167,12 @@ def load_and_process_data():
             
             # 4. Generate real SHAP values
             df['top_shap_factors'] = fallback_ml.get_shap_factors(df)
+            
+            # Extract shap_factor_1/2/3 from JSON for API compatibility
+            parsed = df['top_shap_factors'].apply(lambda s: json.loads(s) if isinstance(s, str) else [])
+            for j in range(3):
+                df[f'shap_factor_{j+1}'] = parsed.apply(lambda x: x[j] if j < len(x) else 'grade_delta')
+                df[f'shap_value_{j+1}'] = 0.0
             
         except ImportError as e:
             print(f"⚠️ sklearn or shap not installed! Using Fake math fallback. ({e})")
@@ -231,8 +250,14 @@ def load_and_process_data():
         # 4. Generate real SHAP values
         df['top_shap_factors'] = fallback_ml.get_shap_factors(df)
         
+        # Extract shap_factor_1/2/3 from JSON for API compatibility
+        parsed = df['top_shap_factors'].apply(lambda s: json.loads(s) if isinstance(s, str) else [])
+        for j in range(3):
+            df[f'shap_factor_{j+1}'] = parsed.apply(lambda x: x[j] if j < len(x) else 'grade_delta')
+            df[f'shap_value_{j+1}'] = 0.0
+        
     except ImportError:
-        print("⚠️ xgboost or shap not installed! Using Fake math fallback.")
+        print("[WARN] xgboost or shap not installed! Using Fake math fallback.")
         df['risk_score'] = _simulate_risk_scores(df)
         df['dropout_predicted'] = (df['risk_score'] >= 0.40).astype(int)
         df['intervention_tier'] = df['risk_score'].apply(_assign_tier)
@@ -307,10 +332,10 @@ def _assign_tier(score):
     Low: < 0.40
     """
     if score >= 0.70:
-        return 'High'
+        return 'high'
     elif score >= 0.40:
-        return 'Medium'
-    return 'Low'
+        return 'medium'
+    return 'low'
 
 
 # Factor interpretations from PRD
@@ -416,9 +441,13 @@ def _build_reason_text(row):
 # ---------------------------------------------------------------------------
 # LOAD DATA ON STARTUP
 # ---------------------------------------------------------------------------
-print("Loading and processing dataset...")
-DF = load_and_process_data()
-print(f"Loaded {len(DF)} students. Dropouts: {DF['dropout_label'].sum()}")
+def perform_initial_load():
+    global DF
+    print("Loading and processing dataset...")
+    DF = load_and_process_data()
+    print(f"Loaded {len(DF)} students. Dropouts: {DF['dropout_label'].sum()}")
+
+perform_initial_load()
 
 # ---------------------------------------------------------------------------
 # PHASE 2: In-memory intervention status store
@@ -665,10 +694,11 @@ def api_students():
         'target', 'grade_delta', 'financial_stress_index',
         'absenteeism_trend', 'engagement_score', 'gender_label',
         'socioeconomic_group', 'reason_text',
-        'shap_factor_1', 'shap_value_1',
-        'shap_factor_2', 'shap_value_2',
-        'shap_factor_3', 'shap_value_3',
     ]
+    # Add SHAP columns only if they exist
+    for sc in ['shap_factor_1', 'shap_value_1', 'shap_factor_2', 'shap_value_2', 'shap_factor_3', 'shap_value_3']:
+        if sc in page_data.columns:
+            columns.append(sc)
 
     rows = [_row_to_dict(row[columns]) for _, row in page_data.iterrows()]
 
@@ -811,8 +841,6 @@ def api_features():
 @app.route('/api/pipeline')
 def api_pipeline():
     """Pipeline architecture metadata, fetching live status from Databricks."""
-    import requests
-    import os
     from dotenv import load_dotenv
 
     load_dotenv(os.path.join(os.path.dirname(__file__), '.env'), override=True)
@@ -833,19 +861,19 @@ def api_pipeline():
         if token and host:
             headers = {"Authorization": f"Bearer {token}"}
             # Fetch the first job
-            jobs_resp = requests.get(f"https://{host}/api/2.1/jobs/list", headers=headers, timeout=5)
+            jobs_resp = _requests_lib.get(f"https://{host}/api/2.1/jobs/list", headers=headers, timeout=5)
             if jobs_resp.status_code == 200:
                 jobs = jobs_resp.json().get('jobs', [])
                 if jobs:
                     job_id = jobs[0]['job_id']
                     # Fetch latest run
-                    runs_resp = requests.get(f"https://{host}/api/2.1/jobs/runs/list?job_id={job_id}&limit=1", headers=headers, timeout=5)
+                    runs_resp = _requests_lib.get(f"https://{host}/api/2.1/jobs/runs/list?job_id={job_id}&limit=1", headers=headers, timeout=5)
                     if runs_resp.status_code == 200:
                         runs = runs_resp.json().get('runs', [])
                         if runs:
                             run_id = runs[0]['run_id']
                             # Fetch run details to get task states
-                            run_detail_resp = requests.get(f"https://{host}/api/2.1/jobs/runs/get?run_id={run_id}", headers=headers, timeout=5)
+                            run_detail_resp = _requests_lib.get(f"https://{host}/api/2.1/jobs/runs/get?run_id={run_id}", headers=headers, timeout=5)
                             if run_detail_resp.status_code == 200:
                                 tasks = run_detail_resp.json().get('tasks', [])
                                 task_states = {}
@@ -881,6 +909,85 @@ def api_pipeline():
             'reason_text — plain-English sentences for advisors',
         ],
     })
+
+
+# ---------------------------------------------------------------------------
+# PIPELINE CONTROL ENDPOINTS
+# ---------------------------------------------------------------------------
+
+@app.route('/api/pipeline/status')
+def api_pipeline_status():
+    """Fetch live status of the Databricks Workflow Job."""
+    host = os.getenv("DATABRICKS_SERVER_HOSTNAME")
+    token = os.getenv("DATABRICKS_TOKEN")
+    job_id = os.getenv("DATABRICKS_JOB_ID")
+    
+    if not host or not token or not job_id:
+        return jsonify({
+            'status': 'offline',
+            'message': 'Databricks credentials not configured in .env'
+        })
+        
+    try:
+        url = f"https://{host}/api/2.1/jobs/runs/list?job_id={job_id}&limit=1"
+        headers = {"Authorization": f"Bearer {token}"}
+        res = _requests_lib.get(url, headers=headers, timeout=5)
+        data = res.json()
+        
+        runs = data.get('runs', [])
+        if not runs:
+            return jsonify({'status': 'pending', 'message': 'No runs found for this job.'})
+            
+        last_run = runs[0]
+        state = last_run.get('state', {})
+        life_cycle = state.get('life_cycle_state')
+        result_state = state.get('result_state')
+        
+        status = 'pending'
+        if life_cycle in ['PENDING', 'RUNNING', 'BLOCKED']:
+            status = 'in_progress'
+        elif life_cycle == 'TERMINATED':
+            status = 'complete' if result_state == 'SUCCESS' else 'failed'
+            
+        return jsonify({
+            'status': status,
+            'life_cycle': life_cycle,
+            'result': result_state,
+            'run_id': last_run.get('run_id'),
+            'start_time': datetime.datetime.fromtimestamp(last_run.get('start_time', 0)/1000).isoformat(),
+            'message': f"Job {life_cycle} ({result_state or 'N/A'})"
+        })
+    except Exception as e:
+        return jsonify({'status': 'offline', 'error': str(e)})
+
+
+@app.route('/api/pipeline/run', methods=['POST'])
+def api_pipeline_run():
+    """Trigger a new run of the Databricks Job."""
+    host = os.getenv("DATABRICKS_SERVER_HOSTNAME")
+    token = os.getenv("DATABRICKS_TOKEN")
+    job_id = os.getenv("DATABRICKS_JOB_ID")
+    
+    if not host or not token or not job_id:
+        return jsonify({'error': 'Databricks credentials missing'}), 400
+        
+    try:
+        url = f"https://{host}/api/2.1/jobs/run-now"
+        headers = {"Authorization": f"Bearer {token}"}
+        res = _requests_lib.post(url, headers=headers, json={"job_id": int(job_id)}, timeout=5)
+        return jsonify(res.json())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/pipeline/reload', methods=['POST'])
+def api_pipeline_reload():
+    """Trigger a full reload of the data and models from source."""
+    try:
+        perform_initial_load()
+        return jsonify({'status': 'success', 'message': 'Dataset reloaded from source.'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 # ---------------------------------------------------------------------------
@@ -948,7 +1055,7 @@ def api_simulate():
         
         before_probs = fallback_ml.get_risk_scores(DF)
     except Exception as e:
-        print(f"⚠️ Baseline Calculation Fallback: {e}")
+        print(f"[WARN] Baseline Calculation Fallback: {e}")
         before_probs = DF['risk_score'].values
 
     # 3. POLICY APPLICATION
@@ -977,7 +1084,7 @@ def api_simulate():
     try:
         after_probs = fallback_ml.get_risk_scores(sim)
     except Exception as e:
-        print(f"⚠️ Simulation Model Fallback: {e}")
+        print(f"[WARN] Simulation Model Fallback: {e}")
         # Manual fallback formula if model fails
         sim_risk = sim.copy()
         gd = sim_risk['grade_delta'].clip(-15, 15)
@@ -995,8 +1102,6 @@ def api_simulate():
         raw = (raw + noise).clip(0, 1)
         logit = np.log(raw / (1 - raw + 1e-9) + 1e-9)
         calibrated = 1 / (1 + np.exp(-logit * 1.2))
-        actual = sim_risk['dropout_label']
-        calibrated = calibrated * 0.6 + actual * 0.35 + 0.025
         after_probs = calibrated.clip(0.01, 0.99).round(3).values
 
     sim['new_risk_score'] = after_probs
@@ -1005,9 +1110,9 @@ def api_simulate():
     def _get_tiers(probs):
         res = []
         for p in probs:
-            if p >= 0.70: res.append('High')
-            elif p >= 0.40: res.append('Medium')
-            else: res.append('Low')
+            if p >= 0.70: res.append('high')
+            elif p >= 0.40: res.append('medium')
+            else: res.append('low')
         return np.array(res)
 
     before_tiers_arr = _get_tiers(before_probs)
@@ -1029,8 +1134,8 @@ def api_simulate():
     print("---------------------------------------\n")
 
     # 8. IMPACT METRICS
-    moved_from_high = int(((before_tiers_arr == 'High') & (after_tiers_arr != 'High')).sum())
-    moved_from_medium = int(((before_tiers_arr == 'Medium') & (after_tiers_arr == 'Low')).sum())
+    moved_from_high = int(((before_tiers_arr == 'high') & (after_tiers_arr != 'high')).sum())
+    moved_from_medium = int(((before_tiers_arr == 'medium') & (after_tiers_arr == 'low')).sum())
 
     return jsonify({
         'before': {
@@ -1038,7 +1143,7 @@ def api_simulate():
             'avg_risk': round(float(np.mean(before_probs)), 3),
         },
         'after': {
-            'tiers': {k: int(after_counts.get(k, 0)) for k in ['High', 'Medium', 'Low']},
+            'tiers': {k: int(after_counts.get(k, 0)) for k in ['high', 'medium', 'low']},
             'avg_risk': round(float(np.mean(after_probs)), 3),
         },
         'impact': {

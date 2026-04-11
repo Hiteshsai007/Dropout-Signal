@@ -11,6 +11,7 @@ let currentTier = 'all';
 let currentSort = 'risk_score';
 let currentOrder = 'desc';
 let searchTimeout = null;
+let lastPipelineStatus = null; // Track status for auto-reload
 
 // Chart.js global defaults
 Chart.defaults.color = '#8b8fa3';
@@ -40,6 +41,9 @@ document.addEventListener('DOMContentLoaded', () => {
     loadRedZone();
     initSimulator();
     loadMitigation();
+
+    const runPipBtn = document.getElementById('run-pipeline-btn');
+    if (runPipBtn) runPipBtn.addEventListener('click', runPipeline);
 });
 
 // ========================================================================
@@ -803,23 +807,50 @@ async function loadPipeline() {
     try {
         const res = await fetch('/api/pipeline');
         const data = await res.json();
-        renderPipeline(data.layers);
+
+        // Also fetch live job status
+        const statusRes = await fetch('/api/pipeline/status');
+        const statusData = await statusRes.json();
+
+        updatePipelineStatusUI(statusData);
+        renderPipeline(data.layers, statusData);
+
+        // Auto-reload: if pipeline was in_progress and is now complete/failed
+        if (lastPipelineStatus === 'in_progress' && (statusData.status === 'complete' || statusData.status === 'failed')) {
+            console.log('Pipeline transitioned to ' + statusData.status + '. Triggering data reload...');
+            triggerDataReload();
+        }
+        lastPipelineStatus = statusData.status;
+
+        // Poll if job is running
+        if (statusData.status === 'in_progress') {
+            setTimeout(loadPipeline, 5000);
+        }
     } catch (err) {
         console.error('Failed to load pipeline:', err);
     }
 }
 
-function renderPipeline(layers) {
+function renderPipeline(layers, jobStatus = null) {
     const container = document.getElementById('pipeline-flow');
     const icons = ['database', 'sparkles', 'brain', 'shield-check', 'eye', 'trophy'];
     const nodeClasses = ['bronze', 'silver', 'model', 'audit', 'shap', 'gold'];
 
     let html = '';
     layers.forEach((layer, i) => {
-        const statusClass = layer.status === 'complete' ? 'ps-complete' :
-                            layer.status === 'in_progress' ? 'ps-progress' : 'ps-pending';
-        const statusLabel = layer.status === 'complete' ? '✓ Complete' :
-                            layer.status === 'in_progress' ? '⟳ In Progress' : '○ Pending';
+        let s = layer.status;
+        if (jobStatus && jobStatus.status === 'in_progress') {
+            s = 'in_progress';
+        } else if (jobStatus && jobStatus.status === 'failed') {
+            s = 'failed';
+        }
+
+        const statusClass = s === 'complete' ? 'ps-complete' :
+                            s === 'in_progress' ? 'ps-progress' :
+                            s === 'failed' ? 'ps-failed' : 'ps-pending';
+        const statusLabel = s === 'complete' ? '✓ Complete' :
+                            s === 'in_progress' ? '⟳ In Progress' :
+                            s === 'failed' ? '⚠ Failed' : '○ Pending';
 
         html += `
             <div class="pipeline-step">
@@ -842,6 +873,79 @@ function renderPipeline(layers) {
 
     container.innerHTML = html;
     lucide.createIcons();
+}
+
+async function triggerDataReload() {
+    const badge = document.getElementById('pipeline-status-badge');
+    if (badge) {
+        badge.textContent = '♻ Reloading Data...';
+        badge.style.color = 'var(--cyan)';
+    }
+    try {
+        const res = await fetch('/api/pipeline/reload', { method: 'POST' });
+        const data = await res.json();
+        console.log('Data reload result:', data);
+        refreshDashboardUI();
+    } catch (err) {
+        console.error('Failed to reload data:', err);
+    } finally {
+        if (badge) { badge.textContent = ''; badge.style.color = ''; }
+    }
+}
+
+function refreshDashboardUI() {
+    console.log('Refreshing all dashboard components...');
+    loadStats();
+    loadRiskDistribution();
+    loadFeatures();
+    loadStudents();
+    loadFairness();
+    loadRedZone();
+    loadMitigation();
+}
+
+function updatePipelineStatusUI(statusData) {
+    const badge = document.getElementById('pipeline-status-badge');
+    const btn = document.getElementById('run-pipeline-btn');
+    if (!badge || !btn) return;
+
+    badge.textContent = statusData.message || (statusData.status === 'offline' ? 'Offline' : 'Ready');
+    badge.className = 'pipeline-status-badge';
+    if (statusData.status === 'in_progress') {
+        badge.style.color = 'var(--amber-light)';
+        btn.disabled = true;
+        btn.innerHTML = '<i data-lucide="loader"></i> Running...';
+    } else {
+        if (statusData.status === 'complete') badge.style.color = 'var(--emerald-light)';
+        if (statusData.status === 'failed') badge.style.color = 'var(--rose-light)';
+        btn.disabled = false;
+        btn.innerHTML = '<i data-lucide="play"></i> Run Pipeline';
+    }
+    lucide.createIcons();
+}
+
+async function runPipeline() {
+    const btn = document.getElementById('run-pipeline-btn');
+    if (btn.disabled) return;
+
+    if (!confirm('This will trigger a full Medallion Architecture (Bronze → Silver → Gold) run in Databricks. Proceed?')) return;
+
+    btn.disabled = true;
+    btn.innerHTML = '<i data-lucide="loader"></i> Triggering...';
+    lucide.createIcons();
+
+    try {
+        const res = await fetch('/api/pipeline/run', { method: 'POST' });
+        const data = await res.json();
+        console.log('Run triggered:', data);
+        setTimeout(loadPipeline, 2000);
+    } catch (err) {
+        console.error('Failed to run pipeline:', err);
+        alert('Failed to trigger pipeline. Check console.');
+        btn.disabled = false;
+        btn.innerHTML = '<i data-lucide="play"></i> Run Pipeline';
+        lucide.createIcons();
+    }
 }
 
 // ========================================================================
@@ -1100,15 +1204,15 @@ async function runSimulation() {
                     <div class="sim-tier-col-header">Before</div>
                     <div class="sim-tier-row">
                         <span class="sim-tier-name" style="color:var(--rose-light)">High</span>
-                        <span class="sim-tier-count">${data.before.tiers.High || 0}</span>
+                        <span class="sim-tier-count">${data.before.tiers.high || 0}</span>
                     </div>
                     <div class="sim-tier-row">
                         <span class="sim-tier-name" style="color:var(--amber-light)">Medium</span>
-                        <span class="sim-tier-count">${data.before.tiers.Medium || 0}</span>
+                        <span class="sim-tier-count">${data.before.tiers.medium || 0}</span>
                     </div>
                     <div class="sim-tier-row">
                         <span class="sim-tier-name" style="color:var(--emerald-light)">Low</span>
-                        <span class="sim-tier-count">${data.before.tiers.Low || 0}</span>
+                        <span class="sim-tier-count">${data.before.tiers.low || 0}</span>
                     </div>
                 </div>
                 <div class="sim-arrow-col">
@@ -1120,15 +1224,15 @@ async function runSimulation() {
                     <div class="sim-tier-col-header">After</div>
                     <div class="sim-tier-row">
                         <span class="sim-tier-name" style="color:var(--rose-light)">High</span>
-                        <span class="sim-tier-count">${data.after.tiers.High || 0}</span>
+                        <span class="sim-tier-count">${data.after.tiers.high || 0}</span>
                     </div>
                     <div class="sim-tier-row">
                         <span class="sim-tier-name" style="color:var(--amber-light)">Medium</span>
-                        <span class="sim-tier-count">${data.after.tiers.Medium || 0}</span>
+                        <span class="sim-tier-count">${data.after.tiers.medium || 0}</span>
                     </div>
                     <div class="sim-tier-row">
                         <span class="sim-tier-name" style="color:var(--emerald-light)">Low</span>
-                        <span class="sim-tier-count">${data.after.tiers.Low || 0}</span>
+                        <span class="sim-tier-count">${data.after.tiers.low || 0}</span>
                     </div>
                 </div>
             </div>

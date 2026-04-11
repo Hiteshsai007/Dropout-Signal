@@ -553,6 +553,14 @@
                 <p class="section-subtitle">Bronze → Silver → Gold: a governed, explainable ML pipeline on Databricks</p>
             </div>
 
+            <div class="pipeline-controls" style="display:flex; align-items:center; justify-content:center; gap:1.5rem; margin-bottom:2rem;">
+                <button class="btn btn-primary" id="run-pipeline-btn">
+                    <i data-lucide="play"></i>
+                    Run Pipeline
+                </button>
+                <span class="pipeline-status-badge" id="pipeline-status-badge" style="font-size:0.85rem; font-weight:600;"></span>
+            </div>
+
             <div class="pipeline-flow" id="pipeline-flow">
                 <!-- Populated by JS -->
             </div>
