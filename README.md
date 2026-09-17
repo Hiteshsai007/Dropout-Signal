@@ -10,6 +10,8 @@ An end-to-end, fair, and explainable machine learning pipeline built on Databric
 
 > **Winner Feature:** Built for non-technical advisors via natural language generation of `reason_text` and robust Platt Calibration for statistically sound intervention tiers.
 
+build by hitesh (me)
+
 ---
 
 ## 🏗️ Architecture (Medallion Lakehouse)
